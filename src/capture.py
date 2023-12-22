@@ -2,10 +2,11 @@ import open3d as o3d
 import numpy as np
 
 class Capture():
-    def __init__(self, params='../settings/setting.json'):
+    def __init__(self, instrinsic_path='data/intrinsic.json'):
         """
-        capture Params from external JSON file
+        Initializes the capture class
         """
+        self.intrinsic_path = instrinsic_path
         self.sensor = self._connect_sensor()        
 
     # set the sensors 
@@ -24,7 +25,7 @@ class Capture():
         :param one_run: if True, runs the loop only once
         """
         azure_intrinsic = o3d.io.read_pinhole_camera_intrinsic(
-            'intrinsic.json'
+            self.intrinsic_path
         )
         while True:
             capture = self.sensor.capture_frame(
