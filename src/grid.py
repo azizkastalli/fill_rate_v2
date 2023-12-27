@@ -1,6 +1,10 @@
 import open3d as o3d
 import numpy as np
 import torch
+from collections import deque
+import matplotlib.pyplot as plt
+import cv2
+
 
 class GridOccupancyMap3D:
     """
@@ -24,6 +28,7 @@ class GridOccupancyMap3D:
         # Calculate the size of the bounding box
         # self.cpu_count = multiprocessing.cpu_count()
         # print("Number of cpus: ", self.cpu_count)
+        self.action = False
         self.cell_size = cell_size
         container_x_size = max_bound[0] - min_bound[0]
         container_y_size = max_bound[1] - min_bound[1]
@@ -48,7 +53,27 @@ class GridOccupancyMap3D:
         # Adjust cell size based on both dimensions
         self.cell_size = max(new_cell_size_x, new_cell_size_y)
         self.grid = np.zeros((self.x_size, self.y_size), dtype=np.float16)
+        self.lowest_grid = np.zeros((self.x_size, self.y_size), dtype=np.float16)
+        self.dz = np.zeros((self.x_size, self.y_size), dtype=np.float16)
+        self.grid_snapshots = deque(maxlen=2)
+        self.dz_snapshots = deque(maxlen=2)
+        self.laplacian_kernel = torch.tensor([[[
+            [0, 1, 0],
+            [1, -4, 1],
+            [0, 1, 0]
+        ]]], dtype=torch.float32)
+        self.gaussian_kernel = torch.tensor([[[
+            [1, 2, 1],
+            [2, 4, 2],
+            [1, 2, 1]
+        ]]], dtype=torch.float32)/16
+        self.action = False
+        cv2.namedWindow('Convolution Result Heatmap',
+                        cv2.WINDOW_NORMAL)  # Create a named window
+        cv2.resizeWindow('Convolution Result Heatmap', 800,
+                         600)  # Set initial width and height
 
+        # print("kernel shape: ", self.laplacian_kernel.shape)
     def generate_grid_boxes(
             self) -> list[o3d.geometry.AxisAlignedBoundingBox]:
         """
@@ -64,7 +89,7 @@ class GridOccupancyMap3D:
             np.arange(self.x_size),
             np.arange(self.y_size), indexing='ij'
         )
-        max_heights = self.grid[grid_x, grid_y]
+        max_heights = self.lowest_grid[grid_x, grid_y]
 
         # Set the minimum height to 0.001
         max_heights = np.where(max_heights == 0, 0.001, max_heights)
@@ -124,6 +149,11 @@ class GridOccupancyMap3D:
 
         # Masking to efficiently assign z-coordinates to grid cells
         self.grid[x_idx, y_idx] = xyz[:, 2]
+        # if len(self.grid_snapshots) == 0:
+        #     self.first_grid = self.grid.copy()
+        self.grid_snapshots.append(self.grid.copy())
+        # if self.action:
+        #     self.lowest_grid = np.minimum(self.lowest_grid, self.grid)
 
     def get_fill_rate(self) -> float:
         """
@@ -137,5 +167,149 @@ class GridOccupancyMap3D:
         filled_volume = np.sum(self.grid.flatten()) * self.cell_size ** 3
         # Calculate the fill rate
         fill_rate = (filled_volume / self.container_volume)*100
-
         return fill_rate
+
+    def remove_outliers(self, dz: np.ndarray, threshold: float = 2.0,
+                        window_size: int = 7) -> np.ndarray:
+        # Create a padded array to handle boundary cases
+        p = (window_size // 2) + 2  # Padding size
+        padded_dz = np.pad(dz, ((p, p), (p, p)),
+                           mode='constant', constant_values=np.nan)
+
+        # Create a rolling window of shape (5, 5)
+        rolling_window = np.lib.stride_tricks.sliding_window_view(
+            padded_dz, (window_size, window_size)
+        )
+
+        # Compute the mean of the rolling window along the last two axes
+        local_means = np.nanmedian(rolling_window, axis=(-2, -1))
+
+        # Compute the absolute deviation of each element from the local mean
+        abs_deviation = np.abs(dz - local_means[2:-2, 2:-2])
+
+        # Identify outliers based on the threshold
+        outliers = abs_deviation > threshold * \
+            np.nanstd(rolling_window, axis=(-2, -1))[2:-2, 2:-2]
+
+        # Replace outliers with the local mean
+        central_value = np.where(outliers, local_means[2:-2, 2:-2], dz)
+
+        return central_value
+
+    def get_grid_dz(self, dz_threshold: float) -> np.ndarray:
+        """
+        This function calculates the height difference between
+        the last two grid snapshots.
+        """
+        dz = self.grid_snapshots[-1] - self.lowest_grid
+        dz_action = self.grid_snapshots[-1] - self.grid_snapshots[-2]
+        # self.dz = np.maximum(dz, self.dz)
+        # self.dz += dz
+        # self.fixed_snapshot = dz.copy()
+        dz = self.remove_outliers(dz, threshold=1.4)
+        dz_action = self.remove_outliers(dz_action, threshold=1.4)
+
+        # dz = np.where(dz > dz_threshold, dz, 0.1)
+        # dz = np.where(dz < -dz_threshold, dz, 0)
+        # self.dz_snapshots.append(dz.copy())
+        # dz = self.grid_snapshots[-1] - self.first_grid
+        return dz, dz_action
+
+    def grid_dz_conv_2d(self, visualize=False) -> np.ndarray:
+        """
+        This function calculates the height difference between
+        the last two grid snapshots. It uses a 2D convolution
+        and shows it with opencv as 2d heatmap.
+        """
+        if len(self.grid_snapshots) == 1:
+            self.fixed_snapshot = self.grid_snapshots[0].copy()
+        if len(self.grid_snapshots) > 1:
+            dz, dz_action = self.get_grid_dz(0)
+            self.detect_action(dz_action)
+            dz = torch.from_numpy(dz)
+            dz = dz.unsqueeze(0).unsqueeze(0)
+            # # print("dz shape: ", dz.shape)
+            dz = dz.to(torch.float32)
+            dz = torch.nn.functional.conv2d(dz, self.gaussian_kernel, padding=1)
+            # # print("dz shape after conv2d: ", dz.shape)
+
+            # # dz = torch.nn.functional.avg_pool2d(dz, 2, stride=2, padding=1)
+            # # print("dz shape after pool2d: ", dz.shape)
+
+            # # dz = torch.nn.functional.conv2d(dz, self.laplacian_kernel, padding=1)
+            dz = dz.squeeze(0).squeeze(0)
+            dz = dz.numpy()
+            if visualize:
+                self.visualize_convolution_heatmap(dz)
+            return dz
+        return None
+
+    def detect_action(self, dz, threshold_action: float = 0.5, threshold_stable: float = 0.01) -> bool:
+        """
+        Detects if there's an action in the grid based on height variations between frames.
+
+        Args:
+            threshold_action (float): Threshold defining an action.
+            threshold_stable (float): Threshold defining stability.
+
+        Returns:
+            bool: True if an action is detected, False if stable.
+        """
+        if len(self.grid_snapshots) < 2:
+            # Not enough frames to compare yet
+            self.action = False
+
+        # Calculate the absolute deviation of each element from the mean
+        abs_deviation = np.abs(dz)
+        
+        # Calculate the maximum deviation in the grid
+        max_deviation = np.max(abs_deviation)
+
+        # Determine if the grid is stable or if an action is detected
+        if max_deviation > threshold_action:
+            self.action = True  # Action detected
+        elif max_deviation < threshold_stable:
+            if self.action:
+                self.lowest_grid = self.grid_snapshots[-2].copy()
+            self.action = False
+        else:
+            self.action = False  # Inconclusive
+
+
+    def grid_neighbors_dz(self, visualize=False) -> np.ndarray:
+        """
+        This function calculates the height difference between 
+        each grid cell and its neighboring cells.
+
+        Returns:
+            np.ndarray: height difference between each grid cell 
+            and its neighboring cells
+        """
+        # Calculate the height difference between each grid cell and its neighbors
+        grid_dz = np.zeros((self.x_size, self.y_size))
+        grid_dz[:-1, :] = self.grid[1:, :] - self.grid[:-1, :]
+        grid_dz[1:, :] = self.grid[:-1, :] - self.grid[1:, :]
+        grid_dz[:, :-1] = self.grid[:, 1:] - self.grid[:, :-1]
+        grid_dz[:, 1:] = self.grid[:, :-1] - self.grid[:, 1:]
+        if visualize:
+            self.visualize_convolution_heatmap(grid_dz)
+        return grid_dz
+
+    def visualize_convolution_heatmap(self, conv_result: np.ndarray):
+        """
+        Visualize the convolution result as a heatmap using matplotlib.
+
+        Args:
+            conv_result (np.ndarray): Convolution result to visualize
+        """
+        # print(conv_result.shape, " -- ", conv_result.dtype)
+        conv_result = conv_result.astype(np.float32)
+        conv_result_normalized = cv2.normalize(
+            conv_result, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U
+        )
+        heatmap = cv2.applyColorMap(conv_result_normalized, cv2.COLORMAP_HOT)
+
+        cv2.imshow('Convolution Result Heatmap', heatmap)
+        key = cv2.waitKey(1)  # Update visualization (1 ms delay)
+        if key == ord('q'):  # Press 'q' to close the window
+            cv2.destroyAllWindows()
