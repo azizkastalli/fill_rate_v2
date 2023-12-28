@@ -4,7 +4,7 @@ import torch
 from collections import deque
 import matplotlib.pyplot as plt
 import cv2
-
+import scipy
 
 class GridOccupancyMap3D:
     """
@@ -28,6 +28,7 @@ class GridOccupancyMap3D:
         # Calculate the size of the bounding box
         # self.cpu_count = multiprocessing.cpu_count()
         # print("Number of cpus: ", self.cpu_count)
+        # self.loaded_grid = np.load("reference_grid.npy")
         self.action = False
         self.cell_size = cell_size
         container_x_size = max_bound[0] - min_bound[0]
@@ -52,8 +53,9 @@ class GridOccupancyMap3D:
         self.y_size = num_y_cells
         # Adjust cell size based on both dimensions
         self.cell_size = max(new_cell_size_x, new_cell_size_y)
+        self.cell_status = np.zeros((self.x_size, self.y_size), dtype=np.uint8)
         self.grid = np.zeros((self.x_size, self.y_size), dtype=np.float16)
-        self.lowest_grid = np.zeros((self.x_size, self.y_size), dtype=np.float16)
+        self.reference_grid = np.zeros((self.x_size, self.y_size), dtype=np.float16)
         self.dz = np.zeros((self.x_size, self.y_size), dtype=np.float16)
         self.grid_snapshots = deque(maxlen=2)
         self.dz_snapshots = deque(maxlen=2)
@@ -89,8 +91,8 @@ class GridOccupancyMap3D:
             np.arange(self.x_size),
             np.arange(self.y_size), indexing='ij'
         )
-        max_heights = self.lowest_grid[grid_x, grid_y]
-
+        max_heights = self.reference_grid[grid_x, grid_y]
+        # print("max_heights: ", np.max(max_heights))
         # Set the minimum height to 0.001
         max_heights = np.where(max_heights == 0, 0.001, max_heights)
         min_bounds = np.array([
@@ -104,12 +106,16 @@ class GridOccupancyMap3D:
             max_heights
         ]).T
 
-        for min_bound, max_bound in zip(
+        for min_bound, max_bound, cell_status in zip(
             min_bounds.reshape(-1, 3),
             max_bounds.reshape(-1, 3),
+            self.cell_status.T.reshape(-1, 1)
         ):
             box = o3d.geometry.AxisAlignedBoundingBox(min_bound, max_bound)
-            box.color = [1, 0, 0]
+            if cell_status == 0:
+                box.color = [1, 0, 0]
+            else:
+                box.color = [0, 1, 0]
             grid_boxes.append(box)
 
         return grid_boxes
@@ -152,8 +158,7 @@ class GridOccupancyMap3D:
         # if len(self.grid_snapshots) == 0:
         #     self.first_grid = self.grid.copy()
         self.grid_snapshots.append(self.grid.copy())
-        # if self.action:
-        #     self.lowest_grid = np.minimum(self.lowest_grid, self.grid)
+
 
     def get_fill_rate(self) -> float:
         """
@@ -196,23 +201,28 @@ class GridOccupancyMap3D:
 
         return central_value
 
-    def get_grid_dz(self, dz_threshold: float) -> np.ndarray:
+    def get_grid_dz(self, dz_threshold:float=0.1) -> np.ndarray:
         """
         This function calculates the height difference between
         the last two grid snapshots.
         """
-        dz = self.grid_snapshots[-1] - self.lowest_grid
+        dz = self.grid_snapshots[-1] - self.reference_grid
         dz_action = self.grid_snapshots[-1] - self.grid_snapshots[-2]
-        # self.dz = np.maximum(dz, self.dz)
-        # self.dz += dz
-        # self.fixed_snapshot = dz.copy()
-        dz = self.remove_outliers(dz, threshold=1.4)
-        dz_action = self.remove_outliers(dz_action, threshold=1.4)
 
-        # dz = np.where(dz > dz_threshold, dz, 0.1)
-        # dz = np.where(dz < -dz_threshold, dz, 0)
-        # self.dz_snapshots.append(dz.copy())
-        # dz = self.grid_snapshots[-1] - self.first_grid
+        dz = self.remove_outliers(dz, threshold=1)
+        dz_action = self.remove_outliers(dz_action, threshold=1)
+        dz = dz.astype(np.float32)
+        dz_action = dz_action.astype(np.float32)
+
+        # detect if a cell is static or dynamic based on the height difference dz
+        # Calculate mean height differences within a moving window
+        mean_dz = np.abs(
+            scipy.ndimage.uniform_filter(dz, size=3)
+        )
+        # Identify dynamic cells based on the threshold
+        self.cell_status = np.where(mean_dz > dz_threshold, 1, 0)
+        # print("mean_dz: ", np.max(mean_dz))
+        self.generate_dynamic_clusters_masks()
         return dz, dz_action
 
     def grid_dz_conv_2d(self, visualize=False) -> np.ndarray:
@@ -224,8 +234,9 @@ class GridOccupancyMap3D:
         if len(self.grid_snapshots) == 1:
             self.fixed_snapshot = self.grid_snapshots[0].copy()
         if len(self.grid_snapshots) > 1:
-            dz, dz_action = self.get_grid_dz(0)
-            self.detect_action(dz_action)
+            dz, dz_action = self.get_grid_dz()
+            self.detect_action(dz_action, dz)
+            # dz = self.cell_status
             dz = torch.from_numpy(dz)
             dz = dz.unsqueeze(0).unsqueeze(0)
             # # print("dz shape: ", dz.shape)
@@ -244,7 +255,30 @@ class GridOccupancyMap3D:
             return dz
         return None
 
-    def detect_action(self, dz, threshold_action: float = 0.5, threshold_stable: float = 0.01) -> bool:
+
+    def generate_dynamic_clusters_masks(self) -> np.ndarray:
+        """
+        Generates masks for dynamic cell clusters.
+
+        Args:
+            threshold (float): Threshold defining dynamic cells.
+            window_size (int): Size of the moving window.
+
+        Returns:
+            np.ndarray: Masks representing dynamic cell clusters.
+        """
+        # Label connected components in the dynamic_cells array
+        labeled, num_features = scipy.ndimage.label(self.cell_status)
+        print("num_features: ", num_features)
+        # Generate masks for dynamic cell clusters
+        masks = []
+        for label in range(1, num_features + 1):
+            mask = labeled == label
+            masks.append(mask)
+
+        self.dynamic_cluster = np.array(masks)
+
+    def detect_action(self, dz_action, dz, threshold_action: float = 0.1, threshold_stable: float = 0.03) -> bool:
         """
         Detects if there's an action in the grid based on height variations between frames.
 
@@ -255,25 +289,30 @@ class GridOccupancyMap3D:
         Returns:
             bool: True if an action is detected, False if stable.
         """
-        if len(self.grid_snapshots) < 2:
-            # Not enough frames to compare yet
-            self.action = False
+        # if len(self.grid_snapshots) < 2:
+        #     # Not enough frames to compare yet
+        #     self.action = False
 
         # Calculate the absolute deviation of each element from the mean
-        abs_deviation = np.abs(dz)
+        abs_deviation = np.abs(dz_action)
         
         # Calculate the maximum deviation in the grid
         max_deviation = np.max(abs_deviation)
-
+        neg_dz = np.where(dz < 0, True, False)
+        min_deviation = np.mean(dz[neg_dz])
         # Determine if the grid is stable or if an action is detected
         if max_deviation > threshold_action:
             self.action = True  # Action detected
+            if min_deviation < -0.1:
+                self.reference_grid = self.grid
+                # print("lowest grid updated dz negative ", min_deviation)
         elif max_deviation < threshold_stable:
             if self.action:
-                self.lowest_grid = self.grid_snapshots[-2].copy()
+                self.reference_grid = self.grid_snapshots[-1].copy()
+                # np.save("reference_grid.npy", self.reference_grid)
+                # print("lowest grid updated")
             self.action = False
-        else:
-            self.action = False  # Inconclusive
+
 
 
     def grid_neighbors_dz(self, visualize=False) -> np.ndarray:
@@ -313,3 +352,4 @@ class GridOccupancyMap3D:
         key = cv2.waitKey(1)  # Update visualization (1 ms delay)
         if key == ord('q'):  # Press 'q' to close the window
             cv2.destroyAllWindows()
+

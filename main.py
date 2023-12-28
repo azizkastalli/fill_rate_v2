@@ -27,6 +27,7 @@ if __name__ == '__main__':
     grid_map = GridOccupancyMap3D(min_bound, max_bound, cell_size=cell_size)
     visualization = True
     show_boxes = True
+    show_stats = False
 
     # connect kinect
     cap = Capture()
@@ -59,23 +60,24 @@ if __name__ == '__main__':
         kinect_pcd.points = o3d.utility.Vector3dVector(xyz)
         kinect_pcd.colors = o3d.utility.Vector3dVector(color)
         grid_map.xyz_to_2Dgrid(xyz)
-        if show_boxes:
-            boxes = grid_map.generate_grid_boxes()
         fill_rate = grid_map.get_fill_rate()
         grid_dz = grid_map.grid_dz_conv_2d(visualize=True)
+        if show_boxes:
+            boxes = grid_map.generate_grid_boxes()
         stop = time()
-        # Print the fill rate
-        sys.stdout.flush()
+
         # Calculate FPS
         frame_count += 1
         if time() - fps_timer > 1:  # Calculate FPS every second
             fps = frame_count / (time() - fps_timer)
             frame_count = 0
             fps_timer = time()
-
         execution_time = (stop-start)*1000
-        sys.stdout.write(
-            f'  Fill rate: {fill_rate:.2f}%  || Time exeuction: {execution_time:.2f} ms || FPS: {fps:.2f} || Action: {np.mean(grid_map.action)} \r')
+        if show_stats:
+            # Print the fill rate
+            sys.stdout.flush() 
+            sys.stdout.write(
+                f'  Fill rate: {fill_rate:.2f}%  || Time exeuction: {execution_time:.2f} ms || FPS: {fps:.2f} || Action: {np.mean(grid_map.action)} \r')
         if visualization:
             vis.add_geometry(kinect_pcd, reset_bounding_box=False)
             vis.add_geometry(bounding_box, reset_bounding_box=False)
